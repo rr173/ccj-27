@@ -1,0 +1,13 @@
+{
+  "name": "msg-bridge",
+  "version": "0.1.0",
+  "description": "Bridge service connecting two messaging systems with independent connector/mapper/deliverer deployment, bidirectional mapping, loop suppression, sequence reconciliation and queryable delivery chains.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node bin/start-all.js",
+    "demo": "node bin/demo.js",
+    "test": "node tests/e2e.test.js"
+  }
+}

@@ -1,0 +1,88 @@
+# Independent deployment: every component is its own service/container.
+# Scale or replace any one without touching the others (connectors/mapper/
+# deliverer only communicate over HTTP and persist to their own volumes).
+#
+#   docker compose up --build
+services:
+  broker-a:
+    build: .
+    command: ["node", "src/systems/broker-a.js"]
+    environment:
+      PORT: "8101"
+    ports: ["8101:8101"]
+
+  broker-b:
+    build: .
+    command: ["node", "src/systems/broker-b.js"]
+    environment:
+      PORT: "8201"
+    ports: ["8201:8201"]
+
+  mapper:
+    build: .
+    command: ["node", "src/mapper/index.js"]
+    environment:
+      PORT: "8301"
+      DATA_DIR: /data
+      BRIDGE_INSTANCE: bridge-1
+    volumes: ["mapper-data:/data"]
+    ports: ["8301:8301"]
+
+  deliverer:
+    build: .
+    command: ["node", "src/deliverer/index.js"]
+    environment:
+      PORT: "8401"
+      DATA_DIR: /data
+      MAPPER_URL: http://mapper:8301
+      CONNECTOR_A_URL: http://connector-a:8501
+      CONNECTOR_B_URL: http://connector-b:8601
+      BATCH_MAX: "5"
+    volumes: ["deliverer-data:/data"]
+    ports: ["8401:8401"]
+    depends_on: [mapper, connector-a, connector-b]
+
+  connector-a:
+    build: .
+    command: ["node", "src/connector/index.js"]
+    environment:
+      SIDE: A
+      PORT: "8501"
+      DATA_DIR: /data
+      BROKER_URL: http://broker-a:8101
+      MAPPER_URL: http://mapper:8301
+      DELIVERER_URL: http://deliverer:8401
+    volumes: ["connector-a-data:/data"]
+    ports: ["8501:8501"]
+    depends_on: [broker-a, mapper, deliverer]
+
+  connector-b:
+    build: .
+    command: ["node", "src/connector/index.js"]
+    environment:
+      SIDE: B
+      PORT: "8601"
+      DATA_DIR: /data
+      BROKER_URL: http://broker-b:8201
+      MAPPER_URL: http://mapper:8301
+      DELIVERER_URL: http://deliverer:8401
+    volumes: ["connector-b-data:/data"]
+    ports: ["8601:8601"]
+    depends_on: [broker-b, mapper, deliverer]
+
+  # Optional production persistence: the reference services currently persist
+  # to an append-only JSONL ledger inside their own volumes (fs-backed). Swap
+  # src/store/ledger.js behind a PostgreSQL repository (documented in README)
+  # for multi-replica/shared-storage deployments.
+  # postgres:
+  #   image: postgres:16-alpine
+  #   environment:
+  #     POSTGRES_PASSWORD: bridge
+  #   volumes: ["pg-data:/var/lib/postgresql/data"]
+
+volumes:
+  mapper-data:
+  deliverer-data:
+  connector-a-data:
+  connector-b-data:
+  # pg-data:
