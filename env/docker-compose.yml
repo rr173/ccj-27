@@ -70,6 +70,18 @@ services:
     ports: ["8601:8601"]
     depends_on: [broker-b, mapper, deliverer]
 
+  quota:
+    build: .
+    command: ["node", "src/quota/index.js"]
+    environment:
+      PORT: "8701"
+      DATA_DIR: /data
+      QUOTA_TICK_MS: "50"
+      QUOTA_REAPER_MS: "200"
+      QUOTA_LEASE_TTL_MS: "5000"
+    volumes: ["quota-data:/data"]
+    ports: ["8701:8701"]
+
   # Optional production persistence: the reference services currently persist
   # to an append-only JSONL ledger inside their own volumes (fs-backed). Swap
   # src/store/ledger.js behind a PostgreSQL repository (documented in README)
@@ -85,4 +97,5 @@ volumes:
   deliverer-data:
   connector-a-data:
   connector-b-data:
+  quota-data:
   # pg-data:

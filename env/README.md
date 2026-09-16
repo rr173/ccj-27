@@ -8,6 +8,9 @@
 - 任一端断线时，对方已确认的消息**不丢**；恢复后从正确序列**补发**
 - 同序列内容冲突时**冻结该段**，支持人工 `skip / override / keep_local`
 - 映射失败、重复确认、连接器重启、部分批量成功都留有**可查询的投递链**
+- 多租户**流量预算与公平调度**：租户双向独立速率/突发/最大在途、业务类共享预算、
+  原子预占→结算、有上限等待区与可查询预计资格时间、租户间按权重 DRR 公平推进、
+  租户内 FIFO、预算修订号 CAS、接管后过期预占单次回收（见第 8 节）
 - 支持 Docker / docker-compose 部署
 
 > 两个系统的编号与确认机制刻意不同，用来证明桥接层确实吸收了差异：
@@ -56,7 +59,7 @@
 要求 Node.js ≥ 18（**零运行时依赖**）。
 
 ```bash
-# 一键在单进程内拉起全部 6 个组件（开发/演示）
+# 一键在单进程内拉起全部 7 个组件（开发/演示）
 npm start
 
 # 另开终端：带旁白的演示，覆盖全部保证
@@ -80,6 +83,20 @@ node bin/bridgectl.js retry <mappingId> --body '{"id":"o-1",...}'
 node bin/bridgectl.js events --type SOURCE_ACK_DUPLICATE
 ```
 
+配额调度器 CLI（默认 `http://localhost:8701`，可用 `QUOTA_URL` 覆盖）：
+
+```bash
+node bin/quotactl.js overview
+node bin/quotactl.js tenants
+node bin/quotactl.js tenant <tenantId>            # 当前占用 / 等待顺序 / 预计资格时间
+node bin/quotactl.js configure-tenant <id> --revision N --in '{...}' --out '{...}'
+node bin/quotactl.js configure-class <id> --in '{...}' --out '{...}'
+node bin/quotactl.js reserve <tenantId> in --request r-1 [--class gold]
+node bin/quotactl.js settle <reservationId> --complete   # 或 --abort
+node bin/quotactl.js request r-1
+node bin/quotactl.js records <tenantId> --type EXPIRY_RECLAIMED
+```
+
 ---
 
 ## 3. Docker 部署（每组件独立）
@@ -88,9 +105,9 @@ node bin/bridgectl.js events --type SOURCE_ACK_DUPLICATE
 docker compose up --build
 ```
 
-compose 启动 6 个独立服务（`broker-a/b`、`connector-a/b`、`mapper`、`deliverer`），
-映射器/投递器/连接器各自挂载独立数据卷。任意一个都可单独重建、替换、扩缩容，
-彼此只靠 HTTP 解耦：
+compose 启动 7 个独立服务（`broker-a/b`、`connector-a/b`、`mapper`、`deliverer`、
+`quota`），映射器/投递器/连接器/配额器各自挂载独立数据卷。任意一个都可单独重建、
+替换、扩缩容，彼此只靠 HTTP 解耦：
 
 | 服务 | 端口 | 关键环境变量 |
 |---|---|---|
@@ -99,6 +116,7 @@ compose 启动 6 个独立服务（`broker-a/b`、`connector-a/b`、`mapper`、`
 | deliverer | 8401 | `MAPPER_URL`, `CONNECTOR_A_URL`, `CONNECTOR_B_URL`, `BATCH_MAX` |
 | connector-a | 8501 | `SIDE=A`, `BROKER_URL`, `MAPPER_URL`, `DELIVERER_URL` |
 | connector-b | 8601 | 同上（`SIDE=B`） |
+| quota | 8701 | `DATA_DIR`, `QUOTA_TICK_MS`, `QUOTA_REAPER_MS`, `QUOTA_LEASE_TTL_MS` |
 
 ---
 
@@ -184,12 +202,110 @@ mappingId / 事件类型 / 序号查询，见第 4 节。
 - deliverer：`POST /deliver`、`POST /loop-suppressed`、`GET /deliveries`、`GET /events`、`GET /overview`
 - 连接器：`POST /egress`、`POST /ingress/complete`、`POST /ingress/release`、
   `GET /state`、`GET /events`、`GET /overview`
+- quota：见第 8.6 节（`/reserve`、`/reservations/:id/settle`、`/admin/tenants|classes`、
+  `/tenants`、`/classes`、`/requests/:id`、`/waiting`、`/events`、`/overview`）
 - broker：`POST /publish`、`POST /pull`、`POST /ack/:seq`(A) / `POST /ack`(B)、
   `POST /admin/rewrite/:seq`（演练冲突）、`GET /admin/state`
 
 ---
 
-## 7. 从参考实现走向生产
+## 8. 多租户流量预算与公平调度（quota，端口 8701）
+
+独立的 **quota** 服务，和其它组件一样用只追加账本持久化（`data/quota/journal.jsonl`），
+只通过 HTTP 解耦。CLI 见 `bin/quotactl.js`。
+
+### 8.1 预算模型
+
+- **租户预算**：每个方向（`in` / `out`）独立配置 `ratePerSec`（令牌速率）、
+  `burst`（突发桶容量）、`maxInflight`（最大在途）；租户级另有 `weight`（DRR 权重）、
+  `waitCapacity`（等待区上限）、`holdTtlMs`（预占有效期）、`waitTimeoutMs`（等待超时）。
+  两个方向的令牌桶与在途计数互不影响。
+- **业务类共享预算**：`class` 也有双向 `ratePerSec / burst / maxInflight`。请求带
+  `class` 时必须**同时**通过租户预算和类预算（桶令牌 + 在途名额都要够）。类预算由所有
+  命中该类的租户共享。
+- **原子预占 → 结算**：`POST /reserve` 是一次原子判定：
+  - 立即通过：返回 `GRANTED` + `reservationId` + 过期时刻；此时令牌**已扣除**、在途名额
+    **已占用**。
+  - 不能通过：进入该租户该方向的 FIFO 等待区（有上限，满了返回 `429 wait_area_full`），
+    返回 `WAITING`、排队位置与**预计资格时间（上界）**。反复查询状态或重复发请求
+    （相同 `requestId` 走幂等返回原结果）**不会改变排队位置**，不能靠轮询取得优先权。
+  - 业务在预占有效期内完成后调用 `POST /reservations/:id/settle`：
+    - `outcome=complete`：释放在途名额，令牌**永久消耗**（不退还，速率由令牌桶自然补充）；
+    - `outcome=abort`：释放在途名额并**退还令牌**（同时补记持有期间自然再生的令牌）。
+
+### 8.2 公平调度
+
+调度器每个 tick（默认 50ms；结算/配置变更会立即额外触发一次）按 **DRR（赤字轮询）**
+在租户间推进：
+
+- 租户间按 `weight` 分配每轮可服务额度（`quantum = weight`），用不完的赤字有上限地结转；
+- **租户内严格 FIFO**（方向内按到达顺序），后面的请求不能越过队头；两个方向各有独立
+  FIFO 队头，互不阻塞；
+- 每轮结束后游标停在"最后被服务租户的下一个"，于是当某类共享资源（或突发窗口）被一个
+  持续打满额度的租户占用时，资源一空出，未被服务的租户排在最前——重租户与轻租户在单一
+  共享名额上**严格交替**，低流量租户不会被饿死。
+
+### 8.3 预算修订号（乐观并发）
+
+- 每次配置变更返回单调递增的 `revision`；修改时带 `expectedRevision`，并发修改只有一个
+  成功，其余返回 `409 revision_conflict`（不传则覆盖式更新）。
+- **降低额度**：已经取得资格（`HELD`）的预占**不撤回**；已在等待的请求不丢弃，按新规则
+  重新参与判定（桶的突发上限立即下调，速率立即按新值再生）。
+- **提高额度**：配置事件追加后调度器**立即**运行一次，等待区里符合新容量的请求当场晋升，
+  无需等旧预占过期。
+
+### 8.4 崩溃恢复与"恰好回收一次"
+
+- 每次启动生成 `ownerEpoch`，并通过账本里的**租约**（`LEASE_ACQUIRED`，默认 TTL 5s，
+  约 TTL/2 续约）保证同一时刻只有一个调度器推进/回收；租约过期后新进程可接管
+  （JSONL 参考实现为单写者；多副本请换第 7 节的 Postgres 仓库）。
+- 调度器意外退出后，**未过期的预占仍然有效**——它们是账本事件，重启 fold 后状态完整，
+  接管者继续承认其结算。
+- 过期预占只能由持有租约的**唯一一个接管者**回收（`EXPIRY_RECLAIMED`：状态机保证同一预占
+  只回收一次，随后退还令牌、释放名额）。
+- 原处理方迟到的完成回执：预占已过期则返回 `LATE_AFTER_EXPIRY` 且**不再次释放任何额度**；
+  预占已结算则返回 `DUPLICATE`。
+
+### 8.5 查询与审计
+
+- `GET /tenants/:id`：当前占用（双向令牌余量、在途预占明细）、等待顺序（位置/预计资格
+  时间/排队时修订号）、预算修订号；`GET /tenants` 为列表。
+- `GET /classes/:id` / `GET /classes`：共享预算占用与等待。
+- `GET /requests/:id`：按请求 `requestId` 查 `WAITING / HELD / COMPLETED / ABORTED /
+  EXPIRED / TIMED_OUT / REJECTED`，等待中含位置与预计资格时间。
+- `GET /tenants/:id/records?type=GRANTED|SETTLED|EXPIRY_RECLAIMED`：该租户每一次预占、
+  结算、过期回收的事件记录；另有 `GET /events?tenantId=`、`GET /waiting`、`GET /overview`。
+
+```bash
+# 配置（首次不传 expectedRevision）
+node bin/quotactl.js configure-tenant acme \
+  --in  '{"ratePerSec":20,"burst":40,"maxInflight":10}' \
+  --out '{"ratePerSec":10,"burst":20,"maxInflight":5}' --weight 3 --hold-ms 30000
+node bin/quotactl.js configure-class gold \
+  --in '{"ratePerSec":100,"burst":100,"maxInflight":50}' \
+  --out '{"ratePerSec":100,"burst":100,"maxInflight":50}'
+# 并发修改：带修订号，只有一个成功（另一个 409 revision_conflict）
+node bin/quotactl.js configure-tenant acme --revision 1 --in '{"ratePerSec":5,"burst":10,"maxInflight":4}'
+
+# 预占 / 查询 / 结算
+node bin/quotactl.js reserve acme in --request r-1 --class gold
+node bin/quotactl.js request r-1
+node bin/quotactl.js settle rsv_... --complete     # 或 --abort
+node bin/quotactl.js tenant acme                   # 占用 + 等待顺序 + 预计资格时间
+node bin/quotactl.js records acme                  # GRANTED/SETTLED/EXPIRY_RECLAIMED
+```
+
+### 8.6 HTTP API 摘要（quota）
+
+`POST /reserve`、`POST /reservations/:id/settle`、
+`POST /admin/tenants`、`POST /admin/classes`、
+`GET /tenants`、`GET /tenants/:id`、`GET /tenants/:id/records`、
+`GET /classes`、`GET /classes/:id`、
+`GET /requests/:id`、`GET /reservations/:id`、`GET /waiting`、`GET /events`、`GET /overview`。
+
+---
+
+## 9. 从参考实现走向生产
 
 当前持久化是**单卷、仅 fsync 到 OS 页缓存的 JSONL 账本**（零依赖、便于看懂与测试）。
 上生产建议：
@@ -212,9 +328,13 @@ src/
   mapper/index.js            # 映射器：映射/冻结/确认/投递链
   deliverer/index.js         # 投递器：outbox/批量/重试/回调补偿
   connector/index.js         # 连接器（参数化 SIDE=A|B）
+  quota/bucket.js            # 令牌桶（惰性补充/扣除/退还）
+  quota/scheduler.js         # 租户间 DRR 公平策略 + 预计资格时间计算
+  quota/index.js             # 配额调度器：预占/等待/结算/过期回收/修订号/租约
   systems/broker-a.js        # 模拟系统 A（逐条 ack）
   systems/broker-b.js        # 模拟系统 B（累积 ack）
-bin/start-all.js bin/demo.js bin/bridgectl.js
+bin/start-all.js bin/demo.js bin/bridgectl.js bin/quotactl.js
 tests/e2e.test.js            # 10 个保证场景
+tests/quota.test.js          # 9 个配额/公平调度/接管场景
 Dockerfile docker-compose.yml
 ```

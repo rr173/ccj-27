@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json ./
 COPY src ./src
 COPY bin ./bin
-RUN chmod +x bin/bridgectl.js
+RUN chmod +x bin/bridgectl.js bin/quotactl.js
 ENV NODE_ENV=production
 # Default command overridden per service in docker-compose.yml
 CMD ["node", "bin/start-all.js"]

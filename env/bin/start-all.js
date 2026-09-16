@@ -5,6 +5,7 @@ import { startBrokerB } from '../src/systems/broker-b.js';
 import { startMapper } from '../src/mapper/index.js';
 import { startDeliverer } from '../src/deliverer/index.js';
 import { startConnector } from '../src/connector/index.js';
+import { startQuota } from '../src/quota/index.js';
 import { logger } from '../src/log.js';
 
 const log = logger('stack');
@@ -16,6 +17,7 @@ export const DEFAULT_PORTS = {
   deliverer: Number(process.env.PORT_DELIVERER || 8401),
   connectorA: Number(process.env.PORT_CONNECTOR_A || 8501),
   connectorB: Number(process.env.PORT_CONNECTOR_B || 8601),
+  quota: Number(process.env.PORT_QUOTA || 8701),
 };
 
 const DATA_ROOT = process.env.DATA_ROOT || './data';
@@ -39,6 +41,11 @@ export async function startAll(dataRoot = DATA_ROOT, ports = DEFAULT_PORTS) {
     mapper: `http://localhost:${ports.mapper}`,
     deliverer: `http://localhost:${ports.deliverer}`,
   });
+  const quota = await startQuota(ports.quota, `${dataRoot}/quota`, {
+    tickMs: Number(process.env.QUOTA_TICK_MS || 50),
+    leaseTtlMs: Number(process.env.QUOTA_LEASE_TTL_MS || 5000),
+    reaperMs: Number(process.env.QUOTA_REAPER_MS || 200),
+  });
 
   log.info('stack_ready', { ports });
 
@@ -48,6 +55,7 @@ export async function startAll(dataRoot = DATA_ROOT, ports = DEFAULT_PORTS) {
     ports,
     deliverer,
     connA,
+    quota,
     async stopB() {
       await connB.stop();
       connB = null;
