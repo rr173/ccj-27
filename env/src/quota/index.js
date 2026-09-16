@@ -26,6 +26,7 @@
 import { mkdirSync } from 'node:fs';
 import { createServer, HttpError } from '../http.js';
 import { Ledger } from '../store/ledger.js';
+import { LeaderLock } from '../store/leader-lock.js';
 import { logger } from '../log.js';
 import { uid, nowIso } from '../util.js';
 import { createBucket, refill, refund } from './bucket.js';
@@ -47,6 +48,25 @@ export const DEFAULTS = {
 };
 
 const GLOBAL_WAIT_CAPACITY = Number(process.env.QUOTA_GLOBAL_WAIT_CAPACITY || 100_000);
+
+// Thrown mid scheduling/reaping round when the cross-process fence shows the
+// lease was stolen. The losing process must stop appending for this round;
+// maintenance ticks will either keep it a follower or recontest later.
+class LeaseLostError extends Error {
+  constructor() {
+    super('lease lost mid-round');
+    this.name = 'LeaseLostError';
+  }
+}
+
+// The on-disk journal advanced past our local view while we believed we were
+// leader: another epoch is writing. Re-anchor (read-only) and stop this round.
+class SeqFencedError extends Error {
+  constructor() {
+    super('journal seq fenced by another epoch');
+    this.name = 'SeqFencedError';
+  }
+}
 
 function initial() {
   return {
@@ -266,7 +286,7 @@ function fold(state, event) {
 }
 
 export class QuotaEngine {
-  constructor(ledger, { tickMs = 50, leaseTtlMs = 5000, reaperMs = 200, maxGrantsPerTick = 5000 } = {}) {
+  constructor(ledger, { tickMs = 50, leaseTtlMs = 5000, reaperMs = 200, maxGrantsPerTick = 5000, leaderLock = null } = {}) {
     this.ledger = ledger;
     this.tickMs = tickMs;
     this.leaseTtlMs = leaseTtlMs;
@@ -277,6 +297,11 @@ export class QuotaEngine {
     this.timers = [];
     this.kickTimer = null;
     this.stopped = false;
+    // Cross-process arbiter of who may append. null in unit-style usage keeps
+    // the engine able to run against a private ledger; production and takeover
+    // tests pass a LeaderLock on the shared data volume.
+    this.leaderLock = leaderLock;
+    this.hasLed = false;
 
     // Rebuild the DRR ring from the durable waiting queue (deficit restarts;
     // fairness is a runtime property, ordering/durability come from the log).
@@ -287,20 +312,36 @@ export class QuotaEngine {
     return this.ledger.state;
   }
 
+  // Leadership requires BOTH the folded lease view (this epoch, unexpired) and
+  // continued ownership of the cross-process lock file. The inode/payload check
+  // fences a process the instant a successor steals its expired lock, even if
+  // it has not yet replayed the successor's LEASE_ACQUIRED event.
   isLeader(nowMs = Date.now()) {
     const l = this.state.lease;
-    return !!l && l.ownerEpoch === this.epoch && l.expiresAtMs > nowMs;
+    if (!l || l.ownerEpoch !== this.epoch || l.expiresAtMs <= nowMs) return false;
+    if (this.leaderLock && !this.leaderLock.isOwner()) return false;
+    return true;
   }
 
   start() {
-    this.ledger.append('SCHEDULER_STARTED', { epoch: this.epoch, at: nowIso() });
-    this.acquireLease();
-    this.timers.push(setInterval(() => this.renewLease(), Math.max(50, this.leaseTtlMs / 2)));
+    // Followers append NOTHING on boot: no SCHEDULER_STARTED, no lease event.
+    // They poll the lock read-only until they win it (or never do).
+    this.tryBecomeLeader('boot');
+    const renewEvery = Math.max(50, Math.floor(this.leaseTtlMs / 2));
+    this.timers.push(setInterval(() => this.maintainLease(), renewEvery));
     this.timers.push(setInterval(() => this.safeReap(), this.reaperMs));
     this.timers.push(setInterval(() => this.safeSchedule(), this.tickMs));
-    // Give an immediate scheduling pass shortly after boot (lease first).
+    // Followers write nothing but still answer queries; re-fold the leader's
+    // durable events on a bounded cadence so their read views stay current.
+    this.timers.push(setInterval(() => {
+      if (!this.stopped && !this.isLeader()) this.ledger.refreshState();
+    }, Math.max(100, this.reaperMs * 5)));
+    // Immediate pass shortly after boot only has any effect if leadership won.
     this.timers.push(setTimeout(() => this.safeSchedule(), 10));
-    log.info('quota_engine_started', { epoch: this.epoch, leaseTtlMs: this.leaseTtlMs });
+    log.info('quota_engine_started', {
+      epoch: this.epoch, leaseTtlMs: this.leaseTtlMs,
+      leader: this.isLeader(),
+    });
   }
 
   async close() {
@@ -309,6 +350,9 @@ export class QuotaEngine {
     for (const t of this.timers) clearTimeout(t);
     this.timers = [];
     if (this.kickTimer) clearTimeout(this.kickTimer);
+    // Graceful shutdown frees the lock immediately so a replacement need not
+    // wait out the TTL. ungraceful exits leave the file for TTL-based stealing.
+    if (this.leaderLock) this.leaderLock.release();
     await this.ledger.close();
   }
 
@@ -316,29 +360,120 @@ export class QuotaEngine {
     if (!this.isLeader()) throw new HttpError(503, 'not_leader', 'scheduler lease held by another epoch');
   }
 
-  acquireLease() {
-    const now = Date.now();
-    const l = this.state.lease;
-    if (l && l.ownerEpoch !== this.epoch && l.expiresAtMs > now) return false;
-    this.ledger.append('LEASE_ACQUIRED', {
-      ownerEpoch: this.epoch,
-      expiresAtMs: now + this.leaseTtlMs,
-      leaseTtlMs: this.leaseTtlMs,
-    });
+  // The ONLY path through which a leader appends. Each append is fenced three
+  // ways against a parallel replacement:
+  //   1. pre-write: still holding the lock file (inode + payload). This is the
+  //      cross-process source of truth and is valid even while we are appending
+  //      the very first LEASE_ACQUIRED that makes isLeader() true in our fold
+  //   2. seq: the durable journal tail must equal our local seq, so our new
+  //      seq is exactly tail+1 and can never duplicate another writer's
+  //   3. post-write: re-check the lock; if it was stolen across the append we
+  //      reload the authoritative log and self-fence for the rest of the round
+  // A process that fails any of these appends NOTHING further this round.
+  fencedAppend(type, data = {}) {
+    if (this.leaderLock) {
+      if (!this.leaderLock.isOwner()) throw new LeaseLostError();
+      const tail = this.ledger.tailSeq();
+      if (tail !== this.ledger.seq) {
+        // Another epoch committed events we have not folded yet. Re-anchor the
+        // read view and let the next tick decide whether we still lead.
+        this.ledger.reload();
+        for (const w of this.state.waiters) activate(this.sched, w.tenantId);
+        throw new SeqFencedError();
+      }
+      const event = this.ledger.append(type, data, { expectedSeq: tail });
+      if (!this.leaderLock.isOwner()) {
+        log.warn('append_post_fence_lost', { epoch: this.epoch, type, seq: event.seq });
+        this.ledger.reload();
+        for (const w of this.state.waiters) activate(this.sched, w.tenantId);
+        throw new LeaseLostError();
+      }
+      return event;
+    }
+    return this.ledger.append(type, data);
+  }
+
+  // One election attempt. Winning the file lock is only the first step: the
+  // LEASE_ACQUIRED append is seq-fenced as well, so two processes that believe
+  // they won (the rename micro-race) serialize at the journal tail — exactly
+  // one append lands at tail+1, the loser sees the tail advanced, reloads and
+  // steps down. Returns true iff we durably lead.
+  tryBecomeLeader(reason) {
+    if (this.stopped) return false;
+    if (this.leaderLock) {
+      let won;
+      try {
+        won = this.leaderLock.tryAcquire(this.epoch);
+      } catch (err) {
+        log.warn('leader_lock_acquire_failed', { reason, err: err.message });
+        return false;
+      }
+      if (!won) return false;
+      // Re-anchor folded state + seq against the winner's durable log BEFORE
+      // our first append, so our seq starts at the real tail.
+      this.ledger.reload();
+      for (const w of this.state.waiters) activate(this.sched, w.tenantId);
+    }
+    try {
+      if (!this.hasLed) {
+        this.fencedAppend('SCHEDULER_STARTED', { epoch: this.epoch, at: nowIso() });
+        this.hasLed = true;
+      }
+      this.fencedAppend('LEASE_ACQUIRED', {
+        ownerEpoch: this.epoch,
+        expiresAtMs: Date.now() + this.leaseTtlMs,
+        leaseTtlMs: this.leaseTtlMs,
+        reason,
+      });
+    } catch (err) {
+      if (err instanceof LeaseLostError || err instanceof SeqFencedError) {
+        // A peer actually owns the term; stay/step down (state already
+        // re-anchored by the fenced append).
+        log.warn('election_append_fenced', { epoch: this.epoch, reason, err: err.name });
+        return false;
+      }
+      throw err;
+    }
+    log.info('lease_acquired', { epoch: this.epoch, reason });
     return true;
   }
 
-  renewLease() {
+  maintainLease() {
     if (this.stopped) return;
-    const now = Date.now();
-    const l = this.state.lease;
-    if (!l || l.ownerEpoch !== this.epoch) {
-      // Try to take over an expired lease (single taker wins: append folds
-      // synchronously against the current lease state).
-      this.acquireLease();
+    if (this.isLeader()) {
+      // Renew the file lock (cross-process fencing) first, then durably record
+      // the renewal through the seq-fenced append. Any failure means another
+      // epoch owns the term: demote now and append nothing.
+      if (this.leaderLock && !this.leaderLock.renew()) {
+        log.warn('lease_lost', { epoch: this.epoch });
+        return;
+      }
+      try {
+        this.fencedAppend('LEASE_ACQUIRED', {
+          ownerEpoch: this.epoch,
+          expiresAtMs: Date.now() + this.leaseTtlMs,
+        });
+      } catch (err) {
+        if (err instanceof LeaseLostError || err instanceof SeqFencedError) {
+          log.warn('renewal_append_fenced', { epoch: this.epoch, err: err.name });
+        } else {
+          throw err;
+        }
+      }
       return;
     }
-    this.ledger.append('LEASE_ACQUIRED', { ownerEpoch: this.epoch, expiresAtMs: now + this.leaseTtlMs });
+    // Follower, or a demoted former leader: recontest only when the lease
+    // recorded on disk is genuinely gone, never preempt a live leader. The
+    // folded state.lease cannot be trusted here — followers append nothing, so
+    // their fold never observes the winner's renewals; read the lock file.
+    if (this.leaderLock) {
+      const onDisk = this.leaderLock.current();
+      if (onDisk && onDisk.ownerEpoch !== this.epoch && onDisk.expiresAtMs > Date.now()) return;
+    } else {
+      const l = this.state.lease;
+      if (l && l.ownerEpoch !== this.epoch && l.expiresAtMs > Date.now()) return;
+    }
+    this.tryBecomeLeader('takeover');
   }
 
   // ---- live views over folded state ----------------------------------
@@ -411,7 +546,8 @@ export class QuotaEngine {
     // scheduling must never promote a timed-out waiter.
     for (const w of [...this.state.waiters]) {
       if (w.deadlineMs && w.deadlineMs <= now) {
-        this.ledger.append('WAIT_TIMED_OUT', {
+        if (!this.isLeader()) return 0;
+        this.fencedAppend('WAIT_TIMED_OUT', {
           reqId: w.reqId, tenantId: w.tenantId, at: nowIso(), waitedMs: now - w.enqueuedAtMs,
         });
       }
@@ -422,6 +558,9 @@ export class QuotaEngine {
     const hasWaiter = (tenantId) => this.headWaiters(tenantId).length > 0;
     const canGrant = (tenantId) => this.headWaiters(tenantId).some((w) => this.eligible(w, Date.now()));
     const grant = (tenantId) => {
+      // Fence per grant: a lock stolen mid-round must stop this process from
+      // appending any further events (the loser cannot keep writing).
+      if (!this.isLeader()) throw new LeaseLostError();
       // Serve the earliest enqueued eligible direction head (FIFO across the
       // tenant's independent direction queues).
       const w = this.headWaiters(tenantId)
@@ -445,7 +584,11 @@ export class QuotaEngine {
     try {
       this.schedule();
     } catch (err) {
-      log.warn('schedule_failed', { err: err.message });
+      if (err instanceof LeaseLostError || err instanceof SeqFencedError) {
+        log.warn('schedule_aborted_lease_lost', { epoch: this.epoch, err: err.name });
+      } else {
+        log.warn('schedule_failed', { err: err.message });
+      }
     }
   }
 
@@ -459,12 +602,13 @@ export class QuotaEngine {
   }
 
   appendGrant(w, { dequeued }) {
+    if (!this.isLeader()) throw new LeaseLostError();
     const now = Date.now();
     const tenant = this.state.tenants[w.tenantId];
     const cls = w.classId ? this.state.classes[w.classId] : null;
     const holdTtlMs = Math.min(w.holdTtlMs ?? tenant.spec.holdTtlMs, tenant.spec.holdTtlMs);
     const reservationId = uid('rsv_');
-    this.ledger.append('GRANTED', {
+    this.fencedAppend('GRANTED', {
       reservationId,
       reqId: w.reqId,
       tenantId: w.tenantId,
@@ -536,7 +680,7 @@ export class QuotaEngine {
     // Otherwise enter the bounded waiting area behind the tenant's FIFO.
     const tenantWaiting = this.state.waiters.filter((w) => w.tenantId === tenantId).length;
     if (tenantWaiting >= tenant.spec.waitCapacity || this.state.waiters.length >= GLOBAL_WAIT_CAPACITY) {
-      this.ledger.append('WAIT_REJECTED', {
+      this.fencedAppend('WAIT_REJECTED', {
         reqId, tenantId, direction, classId,
         reason: 'WAIT_AREA_FULL',
         tenantWaiting, waitCapacity: tenant.spec.waitCapacity,
@@ -550,7 +694,7 @@ export class QuotaEngine {
       : tenant.spec.waitTimeoutMs;
     waiter.deadlineMs = waitTimeoutMs > 0 ? waiter.enqueuedAtMs + waitTimeoutMs : null;
 
-    this.ledger.append('WAIT_ENQUEUED', { waiter });
+    this.fencedAppend('WAIT_ENQUEUED', { waiter });
     activate(this.sched, tenantId);
     const stored = this.state.waiters.find((w) => w.reqId === reqId);
     log.info('wait_enqueued', { reqId, tenantId, direction, enqSeq: stored.enqSeq });
@@ -684,7 +828,8 @@ export class QuotaEngine {
     if (r.status !== 'HELD') {
       return { result: 'DUPLICATE', reservationId, status: r.status, outcome: r.outcome, tokensReleased: 0 };
     }
-    this.ledger.append('SETTLED', {
+    this.requireLeader();
+    this.fencedAppend('SETTLED', {
       reservationId,
       reqId: r.reqId,
       tenantId: r.tenantId,
@@ -711,7 +856,12 @@ export class QuotaEngine {
     let reclaimed = 0;
     for (const r of this.heldReservations()) {
       if (r.expiresAtMs <= now) {
-        this.ledger.append('EXPIRY_RECLAIMED', {
+        // Re-check the cross-process fence before EVERY append: even losing
+        // leadership partway through this batch halts reclaiming immediately,
+        // so a reservation is never reclaimed by two processes (and the
+        // HELD-only fold guard makes the durable log exactly-once as well).
+        if (!this.isLeader()) throw new LeaseLostError();
+        this.fencedAppend('EXPIRY_RECLAIMED', {
           reservationId: r.reservationId,
           reqId: r.reqId,
           tenantId: r.tenantId,
@@ -728,7 +878,8 @@ export class QuotaEngine {
     }
     for (const w of [...this.state.waiters]) {
       if (w.deadlineMs && w.deadlineMs <= now) {
-        this.ledger.append('WAIT_TIMED_OUT', {
+        if (!this.isLeader()) throw new LeaseLostError();
+        this.fencedAppend('WAIT_TIMED_OUT', {
           reqId: w.reqId, tenantId: w.tenantId, classId: w.classId,
           at: nowIso(), waitedMs: now - w.enqueuedAtMs,
         });
@@ -743,7 +894,11 @@ export class QuotaEngine {
     try {
       this.reap();
     } catch (err) {
-      log.warn('reap_failed', { err: err.message });
+      if (err instanceof LeaseLostError || err instanceof SeqFencedError) {
+        log.warn('reap_aborted_lease_lost', { epoch: this.epoch, err: err.name });
+      } else {
+        log.warn('reap_failed', { err: err.message });
+      }
     }
   }
 
@@ -769,7 +924,7 @@ export class QuotaEngine {
       throw new HttpError(400, 'bad_spec', err.message);
     }
     const revision = (prev?.revision || 0) + 1;
-    this.ledger.append('BUDGET_CONFIGURED', {
+    this.fencedAppend('BUDGET_CONFIGURED', {
       kind: 'tenant', tenantId, revision, spec,
       previousRevision: prev?.revision || null,
       operator: b.operator || 'admin',
@@ -796,7 +951,7 @@ export class QuotaEngine {
       throw new HttpError(400, 'bad_spec', err.message);
     }
     const revision = (prev?.revision || 0) + 1;
-    this.ledger.append('BUDGET_CONFIGURED', {
+    this.fencedAppend('BUDGET_CONFIGURED', {
       kind: 'class', classId, revision, spec,
       previousRevision: prev?.revision || null,
       operator: b.operator || 'admin',
@@ -948,7 +1103,29 @@ export async function startQuota(port, dataDir, opts = {}) {
   mkdirSync(dataDir, { recursive: true });
   const ledger = new Ledger(dataDir, { fold, initial, snapshotEvery: 100 });
   await ledger.open();
-  const engine = new QuotaEngine(ledger, opts);
+  const leaseTtlMs = opts.leaseTtlMs ?? 5000;
+  // The lock file lives on the SAME volume as the journal: all candidate
+  // processes competing for that volume arbitrate leadership atomically in the
+  // filesystem (O_CREAT|O_EXCL / atomic rename), independent of the in-memory
+  // fold each process keeps.
+  const leaderLock = opts.leaderLock === undefined
+    ? new LeaderLock(dataDir, { ttlMs: leaseTtlMs })
+    : opts.leaderLock;
+  const engine = new QuotaEngine(ledger, { ...opts, leaseTtlMs, leaderLock });
+
+  // Mutating routes: leadership may be lost between the entry check and the
+  // fenced append during a takeover; surface that as the same 503 not_leader a
+  // non-leader returns up front.
+  const asLeader = (fn) => async (req, res, params, body) => {
+    try {
+      return await fn(req, res, params, body);
+    } catch (err) {
+      if (err instanceof LeaseLostError || err instanceof SeqFencedError) {
+        throw new HttpError(503, 'not_leader', 'leadership changed during request');
+      }
+      throw err;
+    }
+  };
 
   const routes = [
     { method: 'GET', pattern: '/health', handler: async () => ({
@@ -957,16 +1134,16 @@ export async function startQuota(port, dataDir, opts = {}) {
     }) },
 
     // ---- admission / settlement ------------------------------------
-    { method: 'POST', pattern: '/reserve', handler: async (req, res, p, b) => engine.reserve(b) },
+    { method: 'POST', pattern: '/reserve', handler: asLeader(async (req, res, p, b) => engine.reserve(b)) },
     {
       method: 'POST',
       pattern: '/reservations/:id/settle',
-      handler: async (req, res, params, b) => engine.settle(params.id, b),
+      handler: asLeader(async (req, res, params, b) => engine.settle(params.id, b)),
     },
 
     // ---- admin: budgets --------------------------------------------
-    { method: 'POST', pattern: '/admin/tenants', handler: async (req, res, p, b) => engine.configureTenant(b) },
-    { method: 'POST', pattern: '/admin/classes', handler: async (req, res, p, b) => engine.configureClass(b) },
+    { method: 'POST', pattern: '/admin/tenants', handler: asLeader(async (req, res, p, b) => engine.configureTenant(b)) },
+    { method: 'POST', pattern: '/admin/classes', handler: asLeader(async (req, res, p, b) => engine.configureClass(b)) },
 
     // ---- queries ----------------------------------------------------
     {

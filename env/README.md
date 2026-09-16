@@ -256,15 +256,28 @@ mappingId / 事件类型 / 序号查询，见第 4 节。
 
 ### 8.4 崩溃恢复与"恰好回收一次"
 
-- 每次启动生成 `ownerEpoch`，并通过账本里的**租约**（`LEASE_ACQUIRED`，默认 TTL 5s，
-  约 TTL/2 续约）保证同一时刻只有一个调度器推进/回收；租约过期后新进程可接管
-  （JSONL 参考实现为单写者；多副本请换第 7 节的 Postgres 仓库）。
+- 每次启动生成 `ownerEpoch`。同一时刻只有一个调度器推进/回收，这一点由两层共同保证：
+  - **跨进程文件租约**（数据卷上的 `leader.lock`，`src/store/leader-lock.js`）：创建用
+    `open(O_CREAT|O_EXCL)`、发布用原子 `link`/`rename`，由内核仲裁——即使旧进程被
+    `kill -9`、且两个替代进程**并行启动**且都看到旧租约已过期，也只有一个能成为 leader；
+    默认 TTL 5s，约 TTL/2 续约，过期锁可被接管。
+  - **写前/写后 fencing + seq 栅栏**：每次追加前确认仍持有锁（fd 的 dev+inode 与磁盘路径
+    一致）、且账本尾部 seq 等于本进程 seq（`tailSeq` 从磁盘权威读取），写入后再次确认持锁；
+    落败者立即停止追加（本 tick 的调度/回收整轮中止），因此**恢复期间只会选出一个写入者**，
+    账本 seq 严格连续、永不重复。追随者以只读方式运行（不追加任何事件，周期性重 fold 账本以
+    保持查询视图最新），接管成功后先从磁盘重载账本、对齐 seq 才开始写。
+  - 账本里另有逻辑租约事件 `LEASE_ACQUIRED`（可查询、随状态 fold）。注意：单纯依赖该事件
+    无法防止并行接管——两个进程都能各自判定"旧租约过期、我是新主"，文件锁与 seq 栅栏才是
+    跨进程的权威仲裁。（JSONL 参考实现为单卷单写者；多副本/共享盘请换第 9 节的 Postgres 仓库。）
 - 调度器意外退出后，**未过期的预占仍然有效**——它们是账本事件，重启 fold 后状态完整，
   接管者继续承认其结算。
-- 过期预占只能由持有租约的**唯一一个接管者**回收（`EXPIRY_RECLAIMED`：状态机保证同一预占
-  只回收一次，随后退还令牌、释放名额）。
+- 过期预占只能由持有租约的**唯一一个接管者**回收（`EXPIRY_RECLAIMED`）。三道防线保证同一预占
+  **最多回收一次**：①任一时刻只有持锁的 leader 能跑回收；②每次 `EXPIRY_RECLAIMED` 追加前都
+  重新校验持锁与 seq，落败进程立即中止、不再追加；③fold 只在预占为 `HELD` 时生效（重复事件
+  幂等为空操作），随后退还令牌、释放名额。
 - 原处理方迟到的完成回执：预占已过期则返回 `LATE_AFTER_EXPIRY` 且**不再次释放任何额度**；
-  预占已结算则返回 `DUPLICATE`。
+  预占已结算则返回 `DUPLICATE`。向非 leader 发送变更/结算请求返回 `503 not_leader`（追随者
+  仍可服务所有只读查询）。
 
 ### 8.5 查询与审计
 
@@ -324,6 +337,7 @@ node bin/quotactl.js records acme                  # GRANTED/SETTLED/EXPIRY_RECL
 src/
   util.js log.js http.js client.js
   store/ledger.js            # 只追加事件账本（可换成 Postgres）
+  store/leader-lock.js       # 跨进程文件租约（O_EXCL/link/rename + inode fencing）
   mapping/transform.js       # A<->B 信封与业务 body 映射
   mapper/index.js            # 映射器：映射/冻结/确认/投递链
   deliverer/index.js         # 投递器：outbox/批量/重试/回调补偿
@@ -335,6 +349,8 @@ src/
   systems/broker-b.js        # 模拟系统 B（累积 ack）
 bin/start-all.js bin/demo.js bin/bridgectl.js bin/quotactl.js
 tests/e2e.test.js            # 10 个保证场景
-tests/quota.test.js          # 9 个配额/公平调度/接管场景
+tests/quota.test.js          # 11 个配额/公平调度/接管场景
+tests/leader-lock.test.js    # 跨进程文件租约单元场景
+tests/takeover.test.js       # kill -9 + 等凭据过期 + 并行双接管的脑裂回归
 Dockerfile docker-compose.yml
 ```

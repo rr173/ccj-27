@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node bin/start-all.js",
     "demo": "node bin/demo.js",
-    "test": "node tests/e2e.test.js && node tests/quota.test.js",
-    "test:quota": "node tests/quota.test.js"
+    "test": "node tests/e2e.test.js && node tests/quota.test.js && node tests/leader-lock.test.js && node tests/takeover.test.js",
+    "test:quota": "node tests/quota.test.js",
+    "test:takeover": "node tests/takeover.test.js"
   }
 }
